@@ -1,6 +1,8 @@
-import axios from "axios";
+const API_BASE =
+  import.meta.env.VITE_API_URL || "http://localhost:5000";
 
-export async function fetchSpeedTest() {
-  const res = await axios.get("http://YOUR-BACKEND-URL/api/speedtest");
-  return res.data;
-}
+export const fetchSpeedTest = async () => {
+  const res = await fetch(`${API_BASE}/api/speedtest`);
+  return res.json();
+};
+
