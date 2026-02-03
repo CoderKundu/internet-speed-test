@@ -6,13 +6,6 @@ Built using **React + Vite** on the frontend and **Node.js + Express** on the ba
 
 ---
 
-## 🚀 Live Demo
-
-- **Frontend:** net-speedtest.netlify.app
-- **Backend API:** https://internet-speed-test-cd6g.onrender.com
-
----
-
 ## 🧠 Features
 
 - ⚡ Real-time download & upload speed testing
