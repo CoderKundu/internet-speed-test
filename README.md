@@ -31,24 +31,4 @@ A full-stack **Internet Speed Test** web application that measures
 
 ---
 
- 📂 Project Structure
 
-
-internet-speed-test/
-│
-├── backend/
-│   ├── routes/
-│   │   └── speed.js
-│   ├── server.js
-│   └── package.json
-│
-├── frontend/
-│   ├── src/
-│   │   ├── components/
-│   │   ├── hooks/
-│   │   ├── pages/
-│   │   └── services/
-│   ├── index.html
-│   └── package.json
-│
-└── README.md
