@@ -2,6 +2,18 @@
   command = "npm run build"
   publish = "dist"
 
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+# Order matters. Netlify matches redirects top to bottom and stops at the
+# first hit, so the /api rule has to sit above the SPA catch-all.
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
+
 [[redirects]]
   from = "/*"
   to = "/index.html"
