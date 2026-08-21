@@ -1,47 +1,49 @@
 import { ENDPOINTS, CONFIG } from "./config.js";
-import { toMbps } from "./stats.js";
+import { toMbps, percentile } from "./stats.js";
 
 /**
  * Upload throughput.
  *
- * Uses XMLHttpRequest rather than fetch, deliberately. fetch gives you no
- * upload progress events — you learn how many bytes went out only once the
- * whole request completes. XHR exposes xhr.upload.onprogress, which is the
- * only way to drive a live gauge during the upload phase.
+ * Not xhr.upload.onprogress: that fires when bytes reach the OS socket
+ * buffer, not the server, so a 4 MB POST read ~104 Mbps on a 9 Mbps link and
+ * then zero while the buffer drained.
  *
- * The payload is random rather than a zero-filled buffer for the same reason
- * the download endpoint generates randomness: a compressible body would
- * measure compression, not bandwidth.
+ * Not raw completion either: xhr.onload fires for 500s and 413s too, so
+ * bytes are counted only when the endpoint confirms them via {received: N}.
+ *
+ * And not the whole window: upload ramps slowly enough that a 10s test spent
+ * most of its time accelerating. Four consecutive runs reported ~15 Mbps
+ * while their own final samples reached 30-36 — the average was describing
+ * the ramp, not the link.
  */
 function makePayload(bytes) {
   const buf = new Uint8Array(bytes);
-  // getRandomValues caps at 65536 bytes per call, so fill in blocks.
   for (let off = 0; off < bytes; off += 65_536) {
     crypto.getRandomValues(buf.subarray(off, Math.min(off + 65_536, bytes)));
   }
   return buf;
 }
 
-function postChunk(payload, onDelta, signal) {
-  return new Promise((resolve, reject) => {
+function postChunk(payload, signal) {
+  return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
-    let lastLoaded = 0;
-
     xhr.open("POST", ENDPOINTS.upload, true);
+    xhr.responseType = "json";
 
-    xhr.upload.onprogress = (e) => {
-      // e.loaded is cumulative for this request; the engine wants the delta.
-      onDelta(e.loaded - lastLoaded);
-      lastLoaded = e.loaded;
+    xhr.onload = () => {
+      if (xhr.status !== 200) return resolve({ bytes: 0, status: xhr.status });
+      let body = xhr.response;
+      if (typeof body === "string") {
+        try { body = JSON.parse(body); } catch { body = null; }
+      }
+      const ack = body && typeof body.received === "number" ? body.received : 0;
+      resolve({ bytes: ack, status: 200 });
     };
 
-    xhr.onload = () => resolve(xhr.status);
-    xhr.onerror = () => reject(new Error("upload failed"));
-    xhr.onabort = () => resolve(0);
+    xhr.onerror = () => resolve({ bytes: 0, status: 0 });
+    xhr.onabort = () => resolve({ bytes: 0, status: -1 });
 
-    if (signal) {
-      signal.addEventListener("abort", () => xhr.abort(), { once: true });
-    }
+    if (signal) signal.addEventListener("abort", () => xhr.abort(), { once: true });
 
     xhr.send(payload);
   });
@@ -51,7 +53,7 @@ export async function measureUpload({
   durationMs = CONFIG.uploadDurationMs,
   streams = CONFIG.uploadStreams,
   chunkBytes = CONFIG.uploadChunkBytes,
-  warmupMs = CONFIG.warmupMs,
+  warmupMs = CONFIG.uploadWarmupMs,
   maxBytes = CONFIG.maxUploadBytes,
   onSample,
   signal
@@ -59,18 +61,16 @@ export async function measureUpload({
   const start = performance.now();
   const deadline = start + durationMs;
 
-  // Generate once and reuse across requests. Regenerating 4 MB of randomness
-  // inside the loop would burn CPU that shows up as fake latency.
   const payload = makePayload(chunkBytes);
 
   let totalBytes = 0;
+  let requests = 0;
+  let failures = 0;
   let stoppedEarly = false;
   let warmBytes = null;
   let warmTime = null;
 
   const timeline = [];
-  let lastT = start;
-  let lastBytes = 0;
 
   const shouldStop = () =>
     performance.now() >= deadline || totalBytes >= maxBytes || signal?.aborted;
@@ -80,27 +80,35 @@ export async function measureUpload({
     warmTime = performance.now();
   }, warmupMs);
 
+  // Acknowledgements arrive in clumps, so a short window swings between
+  // bursts and gaps.
+  const WINDOW_MS = 2500;
+  const recent = [{ t: start, bytes: 0 }];
+
   const sampler = setInterval(() => {
     const now = performance.now();
-    const seconds = (now - lastT) / 1000;
-    const mbps = toMbps(totalBytes - lastBytes, seconds);
+    recent.push({ t: now, bytes: totalBytes });
+    while (recent.length > 1 && now - recent[0].t > WINDOW_MS) recent.shift();
+
+    const oldest = recent[0];
+    const seconds = (now - oldest.t) / 1000;
+    const mbps = seconds > 0 ? toMbps(totalBytes - oldest.bytes, seconds) : 0;
 
     timeline.push({ atMs: now - start, mbps });
     onSample?.({ mbps, elapsedMs: now - start, phase: "upload" });
-
-    lastT = now;
-    lastBytes = totalBytes;
   }, CONFIG.sampleIntervalMs);
 
   const worker = async () => {
     while (!shouldStop()) {
-      try {
-        await postChunk(payload, (delta) => {
-          totalBytes += delta;
-        }, signal);
-      } catch {
-        break;
+      const { bytes, status } = await postChunk(payload, signal);
+      requests += 1;
+      if (bytes > 0) {
+        totalBytes += bytes;
+      } else {
+        failures += 1;
+        if (failures > 3 && failures >= requests / 2) break;
       }
+      if (status === -1) break;
       if (totalBytes >= maxBytes) stoppedEarly = true;
     }
   };
@@ -116,12 +124,35 @@ export async function measureUpload({
   const measuredSeconds =
     warmTime === null ? (end - start) / 1000 : (end - warmTime) / 1000;
 
+  const mbps = toMbps(measuredBytes, measuredSeconds);
+
+  /**
+   * Ramp diagnostic.
+   *
+   * If the post-warmup window still climbs steadily, the window is still too
+   * short and this figure is still an underestimate. Comparing the last
+   * third against the p90 of all post-warmup samples makes that visible
+   * rather than leaving it to be inferred from a sparkline.
+   */
+  const postWarm = timeline.filter((t) => t.atMs >= warmupMs).map((t) => t.mbps);
+  const lastThird = postWarm.slice(Math.floor(postWarm.length * 0.67));
+  const sustained = lastThird.length
+    ? lastThird.reduce((a, b) => a + b, 0) / lastThird.length
+    : mbps;
+  const peak = postWarm.length ? percentile(postWarm, 90) : mbps;
+  const stillRamping = peak > 0 && sustained / peak > 1.15;
+
   return {
-    mbps: toMbps(measuredBytes, measuredSeconds),
+    mbps,
     totalBytes,
     measuredBytes,
     durationMs: end - start,
     cappedByBytes: stoppedEarly,
+    requests,
+    failures,
+    sustained: Number(sustained.toFixed(2)),
+    peak: Number(peak.toFixed(2)),
+    stillRamping,
     timeline
   };
 }

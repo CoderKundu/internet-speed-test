@@ -1,69 +1,64 @@
 /**
- * Every tunable in one place. Change numbers here, not in the modules.
+ * Every tunable in one place.
  */
 
 export const ENDPOINTS = {
-  ping: "/api/ping",
+  ping: "/ping.txt",
   download: "/api/download",
   upload: "/api/upload"
 };
 
 export const CONFIG = {
-  // Latency
   idlePingSamples: 20,
 
-  // Throughput windows
   downloadDurationMs: 10_000,
-  uploadDurationMs: 8_000,
 
-  // Time to ignore at the start of each throughput phase. TCP starts slow and
-  // ramps up; including that ramp drags your average well below the truth.
+  // Upload runs longer than download because it ramps far more slowly.
+  // Measured evidence: across four runs the final upload samples were
+  // consistently ~2x the reported average, and the sparkline was still
+  // climbing when a 10s window closed. A test that ends mid-ramp reports
+  // the ramp, which is why every run returned the same ~15 Mbps regardless
+  // of conditions.
+  uploadDurationMs: 15_000,
+
+  // Download reaches steady state quickly; 800ms is enough to skip TCP
+  // slow-start.
   warmupMs: 800,
 
-  // Parallel connections. A single TCP stream rarely saturates a fast link,
-  // so one stream systematically under-reports on good connections.
+  // Upload needs far more. This is set from the observed ramp length rather
+  // than from theory — over HTTP/2 the streams share one connection, so
+  // slow-start alone does not explain a multi-second climb at 75ms RTT.
+  // Whatever the mechanism, the data says the first few seconds are not
+  // representative.
+  uploadWarmupMs: 5_000,
+
   downloadStreams: 5,
-  uploadStreams: 3,
+  uploadStreams: 4,
 
-  // Per-request payload sizes.
-  // Netlify caps request bodies at 6 MB (hard 413 above it) and streamed
-  // responses at 20 MB. These sit safely under both.
   downloadChunkBytes: 4_000_000,
-  uploadChunkBytes: 4_000_000,
 
-  // --- Byte ceilings ---------------------------------------------------
-  // A duration-only stop condition is unbounded in bytes. On a gigabit link
-  // a 10-second download moves well over a gigabyte, which would burn a
-  // month of Netlify's 100 GB free bandwidth in roughly 80 runs — and on
-  // loopback, where there is no network limit at all, it simply buries the
-  // dev server.
-  //
-  // The test stops at whichever comes first: the deadline or the ceiling.
-  // Fast connections hit the ceiling early and get a shorter (but still
-  // valid) measurement window.
+  // 1 MB: completion-based counting means chunk size sets gauge
+  // granularity. Netlify's request cap is 6 MB.
+  uploadChunkBytes: 1_000_000,
+
   maxDownloadBytes: 200_000_000,
-  maxUploadBytes: 60_000_000,
 
-  // How often to emit a live sample for the gauge.
+  // Raised to match the longer window — a 15s upload at 35 Mbps moves ~65 MB,
+  // which the old 60 MB ceiling would have truncated, reintroducing the exact
+  // problem this change is meant to fix.
+  maxUploadBytes: 90_000_000,
+
   sampleIntervalMs: 200
 };
 
-/**
- * Tiny preset for testing against `netlify dev`.
- *
- * Loopback has effectively infinite bandwidth, so the full config will
- * saturate your CPU and kill the local server before the run finishes. Use
- * this to check the *shape* of the result; real numbers need a deploy.
- *
- *   runTest({ overrides: LOCAL_TEST_CONFIG })
- */
 export const LOCAL_TEST_CONFIG = {
   idlePingSamples: 8,
   downloadDurationMs: 3_000,
-  uploadDurationMs: 2_000,
+  uploadDurationMs: 3_000,
   downloadStreams: 2,
-  uploadStreams: 1,
+  uploadStreams: 2,
   maxDownloadBytes: 30_000_000,
   maxUploadBytes: 10_000_000,
-  warmupMs: 300
+  warmupMs: 300,
+  uploadWarmupMs: 300
 };

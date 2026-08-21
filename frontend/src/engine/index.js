@@ -2,21 +2,16 @@ import { CONFIG, LOCAL_TEST_CONFIG } from "./config.js";
 import { measureLatency, measureLatencyUntilAborted } from "./latency.js";
 import { measureDownload } from "./download.js";
 import { measureUpload } from "./upload.js";
-import { gradeBufferbloat, buildVerdicts, summarise } from "./verdict.js";
+import { gradeBufferbloat, didSaturate, buildVerdicts, summarise } from "./verdict.js";
+import { percentile } from "./stats.js";
 
 export { CONFIG, LOCAL_TEST_CONFIG } from "./config.js";
 
 /**
  * Runs the full test and returns a single result object.
  *
- * Deliberately UI-free: no React, no DOM, no rendering assumptions. It takes
- * callbacks and returns data, so it can be driven from a console, a Web
- * Worker, or a component without changing a line.
- *
- * @param {(phase: string) => void}  onPhase   "idle-latency" | "download" | "upload" | "done"
- * @param {(sample: object) => void} onSample  live throughput samples for the gauge
- * @param {AbortSignal}              signal    cancel an in-flight test
- * @param {object}                   overrides partial CONFIG, e.g. LOCAL_TEST_CONFIG
+ * UI-free by design: callbacks in, data out. Drivable from a console, a Web
+ * Worker or a component without changing a line.
  */
 export async function runTest({ onPhase, onSample, signal, overrides } = {}) {
   const cfg = { ...CONFIG, ...(overrides ?? {}) };
@@ -30,9 +25,7 @@ export async function runTest({ onPhase, onSample, signal, overrides } = {}) {
     onSample
   });
 
-  // --- Phase 2: download, with latency sampled concurrently -------------
-  // Running the probes *during* saturation is the whole trick. Measuring
-  // latency before and after would show nothing interesting.
+  // --- Phase 2: download, latency sampled concurrently ------------------
   onPhase?.("download");
 
   const loadController = new AbortController();
@@ -65,15 +58,24 @@ export async function runTest({ onPhase, onSample, signal, overrides } = {}) {
     durationMs: cfg.uploadDurationMs,
     streams: cfg.uploadStreams,
     chunkBytes: cfg.uploadChunkBytes,
-    warmupMs: cfg.warmupMs,
+    warmupMs: cfg.uploadWarmupMs ?? cfg.warmupMs,
     maxBytes: cfg.maxUploadBytes,
     signal,
     onSample
   });
 
   // --- Assemble ---------------------------------------------------------
+
+  // 95th percentile, not median: bufferbloat is a worst-case property and
+  // the median hides the spikes that actually break calls.
+  const loadedP95 = loaded.samples.length
+    ? percentile(loaded.samples, 95)
+    : idle.median;
+
   const loadedMedian = loaded.samples.length ? loaded.median : idle.median;
-  const bufferbloat = gradeBufferbloat(idle.median, loadedMedian);
+
+  const saturated = didSaturate(download.timeline);
+  const bufferbloat = gradeBufferbloat(idle.median, loadedP95, saturated);
 
   const result = {
     startedAt,
@@ -82,10 +84,12 @@ export async function runTest({ onPhase, onSample, signal, overrides } = {}) {
     latency: {
       idle: Number(idle.median.toFixed(1)),
       loaded: Number(loadedMedian.toFixed(1)),
+      loadedP95: Number(loadedP95.toFixed(1)),
       min: Number(idle.min.toFixed(1)),
       jitter: Number(idle.jitter.toFixed(1))
     },
     bufferbloat,
+    saturated,
     bytes: {
       downloaded: download.totalBytes,
       uploaded: upload.totalBytes
@@ -93,6 +97,13 @@ export async function runTest({ onPhase, onSample, signal, overrides } = {}) {
     capped: {
       download: download.cappedByBytes,
       upload: upload.cappedByBytes
+    },
+    uploadDetail: {
+      sustained: upload.sustained,
+      peak: upload.peak,
+      stillRamping: upload.stillRamping,
+      requests: upload.requests,
+      failures: upload.failures
     },
     timeline: {
       download: download.timeline,
@@ -119,7 +130,6 @@ export async function runTest({ onPhase, onSample, signal, overrides } = {}) {
   return result;
 }
 
-/** Shorthand for console testing against `netlify dev`. */
 export const runLocalTest = (opts = {}) =>
   runTest({ ...opts, overrides: { ...LOCAL_TEST_CONFIG, ...(opts.overrides ?? {}) } });
 
