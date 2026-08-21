@@ -174,7 +174,7 @@ export default function App() {
 
   const lat = result?.latency;
   const latencyStats = [
-    { label: "Idle", value: lat ? lat.idle.toFixed(1) : "—", color: TEXT },
+    { label: "Idle (to edge)", value: lat ? lat.idle.toFixed(1) : "—", color: TEXT },
     { label: "Under load", value: lat ? lat.loaded.toFixed(1) : "—", color: bbColor },
     {
       label: "Worst 5%",
@@ -383,10 +383,76 @@ export default function App() {
           </div>
         </section>
 
+        <LimitsPanel result={result} />
+
       </div>
     </div>
   );
 }
+
+/**
+ * States plainly where this tool stops being trustworthy.
+ *
+ * Validated against fast.com: download agrees within 10% below ~50 Mbps,
+ * bufferbloat median agrees within 2%. Above that ceiling the bottleneck is
+ * the CDN edge rather than the connection, and upload is capped by the
+ * serverless function that receives it. Publishing those limits alongside the
+ * numbers is the difference between a diagnostic and a decoration.
+ */
+function LimitsPanel({ result }) {
+  const nearCeiling = result && result.download >= 45;
+
+  return (
+    <section style={{ borderTop: `1px solid ${GRID}`, paddingTop: 18, display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ fontFamily: MONO, fontSize: 11, letterSpacing: "0.16em", textTransform: "uppercase", color: DIM }}>
+        Measurement limits
+      </div>
+
+      {nearCeiling && (
+        <div style={{ border: `1px solid oklch(0.80 0.13 75 / 0.4)`, background: "oklch(0.80 0.13 75 / 0.06)", borderRadius: 3, padding: 14, fontFamily: MONO, fontSize: 11, lineHeight: 1.7, color: AMBER }}>
+          This reading is at or near the tool's ceiling. Above ~50 Mbps the CDN
+          edge becomes the bottleneck, not your connection — your real download
+          speed is likely higher than shown.
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(260px,1fr))", gap: 12 }}>
+        {LIMITS.map((l) => (
+          <div key={l.title} style={{ border: `1px solid ${GRID}`, background: CARD, borderRadius: 3, padding: 16, display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ fontFamily: MONO, fontSize: 12, letterSpacing: "0.08em", color: TEXT }}>{l.title}</div>
+            <div style={{ fontFamily: MONO, fontSize: 11, lineHeight: 1.7, color: "oklch(0.60 0.008 230)" }}>{l.body}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ fontFamily: MONO, fontSize: 11, lineHeight: 1.7, color: "oklch(0.55 0.008 230)", maxWidth: "80ch" }}>
+        Validated against fast.com on the same connection: download agrees
+        within 10% below the ceiling, bufferbloat median agrees within 2%.
+        Full methodology and the seven measurement bugs found while building
+        this are in the README.
+      </div>
+    </section>
+  );
+}
+
+const LIMITS = [
+  {
+    title: "Download ceiling ≈50 Mbps",
+    body: "The payload is a static CDN asset. A single fetch tops out at 25–47 Mbps regardless of chunking or concurrency, so faster links measure the host rather than the connection."
+  },
+  {
+    title: "Upload under-reports",
+    body: "Receiving bytes needs a server, so a serverless function stays in the path and caps throughput. Measured 25–30 Mbps against a reference reading of 110."
+  },
+  {
+    title: "Latency is to the CDN edge",
+    body: "Not to a nearby server. This deploy reads ~78ms where a test using in-country servers reads ~10ms. Both are real; they answer different questions."
+  },
+  {
+    title: "Worst 5% includes this tool",
+    body: "The latency probe shares an HTTP/2 connection with the download streams, so a probe can stall behind queued data. Bufferbloat is graded on the median for that reason."
+  }
+];
 
 function MetricCard({ label, value, note, bars }) {
   return (
