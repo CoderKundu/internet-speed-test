@@ -4,19 +4,23 @@ import { toMbps } from "./stats.js";
 /**
  * Download throughput.
  *
- * Fixed *duration*, not fixed size. Each worker loops — request a chunk, read
- * it to completion, request another — until the deadline. A fixed-size test
- * takes 40 seconds on a slow line and 0.2 seconds on a fast one, and 0.2
- * seconds is far too short to measure anything stable.
+ * ---------------------------------------------------------------------------
+ * Why a static file and not a serverless function
+ * ---------------------------------------------------------------------------
+ * The original endpoint generated random bytes per request inside a Netlify
+ * function. Feeding a 100 Mbps link that way means producing 12.5 MB of
+ * crypto-grade randomness every second inside a Lambda, which is nowhere
+ * near achievable. The result: fast.com measured this connection at 100 Mbps
+ * while this tool reported 20, and the sparkline showed the isolated bursts
+ * characteristic of a compute-bound producer rather than a saturated link.
  *
- * Stops at whichever arrives first: the deadline or maxBytes. Without the
- * byte ceiling the test is unbounded in data volume, which is a problem both
- * for hosting bandwidth and for local testing where there is no network to
- * act as a natural brake.
+ * That is the same failure the project's original backend had — it shelled
+ * out to the Ookla CLI and measured the *server's* bandwidth. Generating
+ * bytes in a function measures the function.
  *
- * Bytes are counted as they stream in via getReader(), which is also what
- * feeds the live gauge. Waiting for arrayBuffer() would give you one number
- * at the end and nothing to animate.
+ * A static asset is served straight from the CDN edge at line rate, with no
+ * compute in the path. Range requests carve arbitrary chunk sizes out of one
+ * file, so a single 16 MB asset covers every chunk size the engine needs.
  */
 export async function measureDownload({
   durationMs = CONFIG.downloadDurationMs,
@@ -32,7 +36,6 @@ export async function measureDownload({
 
   let totalBytes = 0;
   let stoppedEarly = false;
-
   let warmBytes = null;
   let warmTime = null;
 
@@ -60,18 +63,36 @@ export async function measureDownload({
     lastBytes = totalBytes;
   }, CONFIG.sampleIntervalMs);
 
-  const worker = async () => {
+  const assetSize = CONFIG.downloadAssetBytes;
+  const span = Math.min(chunkBytes, assetSize) - 1;
+
+  const worker = async (workerIndex) => {
+    let round = 0;
+
     while (!shouldStop()) {
+      // Vary the range per request so neither the browser nor an
+      // intermediate proxy can serve a repeat from cache, which would
+      // otherwise report an imaginary multi-gigabit result.
+      const maxOffset = Math.max(0, assetSize - span - 1);
+      const offset = maxOffset > 0
+        ? Math.floor(Math.random() * maxOffset)
+        : 0;
+
       let res;
       try {
         res = await fetch(
-          `${ENDPOINTS.download}?bytes=${chunkBytes}&cb=${Math.random()}`,
-          { cache: "no-store", signal }
+          `${ENDPOINTS.download}?cb=${workerIndex}-${round++}-${Math.random()}`,
+          {
+            cache: "no-store",
+            signal,
+            headers: { Range: `bytes=${offset}-${offset + span}` }
+          }
         );
       } catch {
         break;
       }
 
+      // 206 = partial content (ranges honoured), 200 = whole file returned.
       if (!res.ok || !res.body) break;
 
       const reader = res.body.getReader();
@@ -81,8 +102,6 @@ export async function measureDownload({
           if (done) break;
           totalBytes += value.length;
 
-          // Bail out mid-chunk rather than letting a slow connection
-          // overrun the window, or a fast one blow past the ceiling.
           if (shouldStop()) {
             if (totalBytes >= maxBytes) stoppedEarly = true;
             await reader.cancel();
@@ -95,7 +114,7 @@ export async function measureDownload({
     }
   };
 
-  await Promise.all(Array.from({ length: streams }, worker));
+  await Promise.all(Array.from({ length: streams }, (_, i) => worker(i)));
 
   clearTimeout(warmupTimer);
   clearInterval(sampler);
@@ -111,9 +130,6 @@ export async function measureDownload({
     totalBytes,
     measuredBytes,
     durationMs: end - start,
-    // True when the byte ceiling ended the run instead of the clock. Worth
-    // surfacing: it means the connection is fast enough that the window was
-    // shorter than intended, so the figure is less settled.
     cappedByBytes: stoppedEarly,
     timeline
   };

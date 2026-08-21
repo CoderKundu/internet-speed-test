@@ -176,12 +176,17 @@ export default function App() {
   const latencyStats = [
     { label: "Idle", value: lat ? lat.idle.toFixed(1) : "—", color: TEXT },
     { label: "Under load", value: lat ? lat.loaded.toFixed(1) : "—", color: bbColor },
-    { label: "Minimum", value: lat ? lat.min.toFixed(1) : "—", color: TEXT },
+    {
+      label: "Worst 5%",
+      value: lat && lat.loadedP95 ? lat.loadedP95.toFixed(0) : "—",
+      color: lat && lat.loadedP95 > 500 ? AMBER : TEXT
+    },
     { label: "Jitter", value: lat ? lat.jitter.toFixed(1) : "—", color: lat && lat.jitter > 15 ? AMBER : TEXT }
   ];
 
   const bbMax = Math.max(lat?.loaded ?? 1, 1);
-  const passCount = result?.verdicts.filter((v) => v.ok).length ?? 0;
+  const passCount = result?.verdicts.filter((v) => v.status === "pass").length ?? 0;
+  const unknownCount = result?.verdicts.filter((v) => v.status === "inconclusive").length ?? 0;
   const capped = result?.capped?.download || result?.capped?.upload;
 
   return (
@@ -331,24 +336,38 @@ export default function App() {
         <section style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 16 }}>
             <div style={{ fontFamily: MONO, fontSize: 11, letterSpacing: "0.16em", textTransform: "uppercase", color: DIM }}>What this connection can do</div>
-            <div style={{ fontFamily: MONO, fontSize: 11, color: "oklch(0.55 0.008 230)" }}>{result ? `${passCount} of ${result.verdicts.length} pass` : ""}</div>
+            <div style={{ fontFamily: MONO, fontSize: 11, color: "oklch(0.55 0.008 230)" }}>{result ? (unknownCount ? `${passCount} pass \u00b7 ${unknownCount} inconclusive` : `${passCount} of ${result.verdicts.length} pass`) : ""}</div>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(210px,1fr))", gap: 12 }}>
             {(result?.verdicts ?? PLACEHOLDER_VERDICTS).map((v) => {
               const done = Boolean(result);
-              const color = done ? (v.ok ? CYAN : RED) : MUTED;
-              const border = done ? (v.ok ? "oklch(0.78 0.13 195 / 0.4)" : "oklch(0.68 0.17 25 / 0.4)") : GRID;
+              const st = done ? v.status : "pending";
+              const color =
+                st === "pass" ? CYAN :
+                st === "fail" ? RED :
+                st === "inconclusive" ? AMBER : MUTED;
+              const border =
+                st === "pass" ? "oklch(0.78 0.13 195 / 0.4)" :
+                st === "fail" ? "oklch(0.68 0.17 25 / 0.4)" :
+                st === "inconclusive" ? "oklch(0.80 0.13 75 / 0.4)" : GRID;
               return (
                 <div key={v.name} style={{ border: `1px solid ${border}`, background: CARD, borderRadius: 3, padding: 18, display: "flex", flexDirection: "column", gap: 10, minHeight: 118 }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
                     <span style={{ fontSize: 15, fontWeight: 500 }}>{v.name}</span>
                     <span style={{ fontFamily: MONO, fontSize: 13, width: 22, height: 22, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "50%", border: `1px solid ${border}`, color, flex: "none" }}>
-                      {done ? (v.ok ? "✓" : "✕") : "·"}
+                      {st === "pass" ? "✓" : st === "fail" ? "✕" : st === "inconclusive" ? "?" : "·"}
                     </span>
                   </div>
                   <div style={{ fontFamily: MONO, fontSize: 11, lineHeight: 1.6, color: "oklch(0.60 0.008 230)" }}>{v.detail}</div>
-                  <div style={{ marginTop: "auto", fontFamily: MONO, fontSize: 10, letterSpacing: "0.16em", textTransform: "uppercase", color }}>
-                    {done ? v.status : "pending"}
+                  <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 4 }}>
+                    <div style={{ fontFamily: MONO, fontSize: 10, letterSpacing: "0.16em", textTransform: "uppercase", color }}>
+                      {st}
+                    </div>
+                    {st === "inconclusive" && (
+                      <div style={{ fontFamily: MONO, fontSize: 10, lineHeight: 1.5, color: "oklch(0.55 0.008 230)" }}>
+                        capped by the test host, not your link
+                      </div>
+                    )}
                   </div>
                 </div>
               );

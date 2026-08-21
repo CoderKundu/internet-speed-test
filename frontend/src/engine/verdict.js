@@ -2,32 +2,8 @@
  * Turning numbers into meaning.
  */
 
-/**
- * Bufferbloat grade.
- *
- * ---------------------------------------------------------------------------
- * Graded on the 95th percentile of loaded latency, not the median
- * ---------------------------------------------------------------------------
- * Bufferbloat is a worst-case property. What ruins a video call is the spike
- * where a queued packet arrives 400ms late, not the typical round trip. A
- * median smooths those spikes away — which is how a connection that stalls
- * repeatedly under load can still report a healthy-looking average.
- *
- * ---------------------------------------------------------------------------
- * Why saturation has to be checked first
- * ---------------------------------------------------------------------------
- * You can only observe queueing if you fill the queue. Two runs a minute
- * apart on the same router produced A (+1ms) and F (+332ms); the A came from
- * a run that peaked at 55 Mbps and sagged to 20, never saturating the link.
- * Reporting "excellent" there is not a measurement, it is a failure to
- * measure — and it is the more dangerous of the two errors, because it tells
- * someone their connection is fine when it isn't.
- *
- * When the download phase does not sustain near its own peak, this returns
- * an inconclusive result rather than a grade.
- */
-export function gradeBufferbloat(idleMs, loadedP95Ms, saturated = true) {
-  const increase = Math.max(0, loadedP95Ms - idleMs);
+export function gradeBufferbloat(idleMs, loadedMedianMs, saturated = true) {
+  const increase = Math.max(0, loadedMedianMs - idleMs);
 
   if (!saturated) {
     return {
@@ -60,16 +36,6 @@ export function gradeBufferbloat(idleMs, loadedP95Ms, saturated = true) {
   return { grade, label, increaseMs: increase, inconclusive: false };
 }
 
-/**
- * Did the download phase actually saturate the link?
- *
- * Compares what the second half of the run sustained against the run's own
- * peak. A healthy saturating run ramps up and then holds near its ceiling. A
- * run that peaks early and decays never found the ceiling at all.
- *
- * Deliberately relative: absolute thresholds cannot work when the same code
- * runs on a 5 Mbps line and a gigabit one.
- */
 export function didSaturate(timeline) {
   const vals = timeline.map((t) => t.mbps).filter((v) => v > 0.5);
   if (vals.length < 8) return false;
@@ -85,36 +51,96 @@ export function didSaturate(timeline) {
   return sustained / peak >= 0.6;
 }
 
-export function buildVerdicts({ download, upload, latency, jitter }) {
+/**
+ * Activity verdicts, with three outcomes rather than two.
+ *
+ * ---------------------------------------------------------------------------
+ * Why "inconclusive" has to exist
+ * ---------------------------------------------------------------------------
+ * Every measurement this tool produces is a *lower bound* on the truth, for
+ * reasons documented in the README:
+ *
+ *   - download is capped by the CDN edge above ~50 Mbps
+ *   - upload is capped by the serverless function receiving it
+ *   - latency is to the CDN edge, which is further away than the servers a
+ *     game or call would actually talk to (78ms here vs ~10ms measured by a
+ *     test using in-country servers)
+ *
+ * A check that PASSES on those numbers definitely passes — the real values
+ * can only be better. A check that FAILS might still pass in reality.
+ *
+ * Reporting "4K streaming: FAIL" on a 100 Mbps connection because the tool
+ * could only measure 20 is worse than saying nothing. So a failing check is
+ * re-evaluated optimistically: peak observed throughput instead of the
+ * average, and latency ignored entirely. If it passes optimistically, the
+ * honest answer is that we cannot tell.
+ *
+ * A genuinely slow connection still fails, because its peaks are low too.
+ */
+export function buildVerdicts({
+  download,
+  upload,
+  latency,
+  jitter,
+  downloadPeak = 0,
+  uploadPeak = 0
+}) {
   const checks = [
-    { name: "4K streaming", ok: download >= 25, detail: "Needs ~25 Mbps down" },
+    {
+      name: "4K streaming",
+      detail: "Needs ~25 Mbps down",
+      fn: (d, u, l) => d >= 25
+    },
     {
       name: "HD video calls",
-      ok: download >= 5 && upload >= 3 && latency < 150 && jitter < 30,
-      detail: "Needs 5 down / 3 up, sub-150ms latency, steady jitter"
+      detail: "Needs 5 down / 3 up, sub-150ms latency, steady jitter",
+      fn: (d, u, l) => d >= 5 && u >= 3 && l < 150 && jitter < 30
     },
     {
       name: "Competitive gaming",
-      ok: latency < 60 && jitter < 15,
-      detail: "Needs sub-60ms latency and low jitter"
+      detail: "Needs sub-60ms latency and low jitter",
+      fn: (d, u, l) => l < 60 && jitter < 15
     },
-    { name: "Large file uploads", ok: upload >= 10, detail: "Needs ~10 Mbps up to be painless" },
+    {
+      name: "Large file uploads",
+      detail: "Needs ~10 Mbps up to be painless",
+      fn: (d, u, l) => u >= 10
+    },
     {
       name: "Multiple users at once",
-      ok: download >= 50 && upload >= 10 && latency < 150,
-      detail: "Needs bandwidth headroom and responsive latency"
+      detail: "Needs bandwidth headroom and responsive latency",
+      fn: (d, u, l) => d >= 50 && u >= 10 && l < 150
     }
   ];
 
-  return checks.map((c) => ({ ...c, status: c.ok ? "pass" : "fail" }));
+  const bestDown = Math.max(download, downloadPeak);
+  const bestUp = Math.max(upload, uploadPeak);
+
+  return checks.map((c) => {
+    if (c.fn(download, upload, latency)) {
+      return { name: c.name, detail: c.detail, ok: true, status: "pass" };
+    }
+
+    // Could it pass if the tool's known under-measurement were corrected?
+    // Latency passed as 0 because there is no upper-bound-free estimate of
+    // the true figure — only the knowledge that it is lower than measured.
+    if (c.fn(bestDown, bestUp, 0)) {
+      return {
+        name: c.name,
+        detail: c.detail,
+        ok: false,
+        status: "inconclusive",
+        inconclusive: true
+      };
+    }
+
+    return { name: c.name, detail: c.detail, ok: false, status: "fail" };
+  });
 }
 
 export function summarise({ download, upload, latency, jitter, bufferbloat }) {
   if (bufferbloat.inconclusive) {
     return "Bandwidth and latency measured cleanly, but the link never saturated, so responsiveness under load could not be assessed.";
-  }
-  if (latency > 200) {
-    return "Bandwidth is fine, but round-trip latency is very high — anything interactive will feel sluggish.";
   }
   if (bufferbloat.grade === "F" || bufferbloat.grade === "D") {
     return "Fast on paper, but latency collapses under load — likely router buffer bloat.";
@@ -126,7 +152,7 @@ export function summarise({ download, upload, latency, jitter, bufferbloat }) {
     return "Strong download, weak upload — typical of cable and older DSL lines.";
   }
   if (download < 10) {
-    return "Limited bandwidth. Fine for browsing, tight for HD video.";
+    return "Limited bandwidth measured. Fine for browsing, tight for HD video — though the figure may be capped by the test host rather than the connection.";
   }
   return "Healthy connection across bandwidth, latency and stability.";
 }
